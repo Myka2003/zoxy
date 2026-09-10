@@ -1,0 +1,43 @@
+runtime_dir="${XDG_RUNTIME_DIR:?}"
+socket_link="$runtime_dir/wayland-game"
+sway_socket="$runtime_dir/zoxy-stream-sway.sock"
+before=$(find "$runtime_dir" -maxdepth 1 -type s -name 'wayland-*' -printf '%f\n' | sort)
+sway_pid=""
+
+# Sway chooses its Wayland socket automatically; publish a stable alias
+# for Sunshine and the games launched in this isolated session.
+# shellcheck disable=SC2329
+cleanup() {
+  trap - EXIT INT TERM
+  if [ -n "$sway_pid" ]; then
+    kill -TERM -- "-$sway_pid" 2>/dev/null || kill -TERM "$sway_pid" 2>/dev/null || true
+  fi
+  rm -f "$socket_link" "$sway_socket"
+}
+trap cleanup EXIT INT TERM
+
+rm -f "$socket_link" "$sway_socket"
+export SWAYSOCK="$sway_socket"
+unset WAYLAND_DISPLAY DISPLAY
+setsid sway -c "${ZOXY_SWAY_CONFIG:?ZOXY_SWAY_CONFIG unset}" &
+sway_pid=$!
+
+socket=""
+for _ in $(seq 1 80); do
+  for candidate in "$runtime_dir"/wayland-*; do
+    [ -S "$candidate" ] || continue
+    name=$(basename "$candidate")
+    if ! printf '%s\n' "$before" | grep -Fqx "$name"; then
+      socket="$name"
+      break 2
+    fi
+  done
+  sleep 0.25
+done
+if [ -z "$socket" ]; then
+  printf '%s\n' 'zoxy-stream-sway: headless Wayland socket did not appear' >&2
+  exit 1
+fi
+
+ln -s "$socket" "$socket_link"
+wait "$sway_pid"

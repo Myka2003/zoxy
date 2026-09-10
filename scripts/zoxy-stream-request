@@ -1,0 +1,90 @@
+if [ "$#" -ne 2 ]; then
+  printf '%s\n' 'usage: zoxy-stream-request <target-id> /path/to/game.exe' >&2
+  exit 2
+fi
+
+target_id="$1"
+target_path="$2"
+config="${ZOXY_CONFIG:-/etc/zoxy/config.json}"
+
+if [ ! -r "$config" ]; then
+  printf 'zoxy-stream-request: configuration file not found: %s\n' "$config" >&2
+  exit 1
+fi
+
+if ! target_info=$(jq -e -r --arg id "$target_id" '.targets[$id] // empty' "$config"); then
+  printf 'zoxy-stream-request: target not found: %s\n' "$target_id" >&2
+  exit 1
+fi
+
+target_type=$(printf '%s' "$target_info" | jq -r '.type // empty')
+if [ "$target_type" != "moonlight-client" ]; then
+  printf 'zoxy-stream-request: target %s is not a moonlight-client\n' "$target_id" >&2
+  exit 1
+fi
+
+client_host=$(printf '%s' "$target_info" | jq -r '.clientHost // empty')
+client_user=$(printf '%s' "$target_info" | jq -r '.clientUser // empty')
+display_mode=$(printf '%s' "$target_info" | jq -r '.displayMode // "windowed"')
+resolution=$(printf '%s' "$target_info" | jq -r '.resolution // "1920x1080"')
+
+sunshine_host=$(jq -r '.stream.sunshineHost // "beelink-ser7"' "$config")
+sunshine_app=$(jq -r '.stream.sunshineApp // "Zoxy Session"' "$config")
+
+if [ -z "$client_host" ] || [ -z "$client_user" ]; then
+  printf 'zoxy-stream-request: missing clientHost or clientUser for target %s\n' "$target_id" >&2
+  exit 1
+fi
+
+state_dir="$HOME/.local/state/zoxy"
+request="$state_dir/remote-request.json"
+active="$state_dir/remote-active.json"
+lock_file="$state_dir/remote.lock"
+install -d -m 700 "$state_dir"
+exec 9>"$lock_file"
+chmod 0600 "$lock_file"
+flock -w 5 9 || {
+  printf '%s\n' 'zoxy-stream-request: another stream request is in progress' >&2
+  exit 1
+}
+
+now=$(date +%s)
+if [ -e "$active" ]; then
+  rm -f "$active"
+fi
+if [ -f "$request" ]; then
+  if jq -e --argjson now "$now" '
+    (.version == 1)
+    and ((.created_at | type) == "number")
+    and (.created_at >= ($now - 120))
+    and (.created_at <= ($now + 30))
+  ' "$request" >/dev/null; then
+    printf '%s\n' 'zoxy-stream-request: a pending request already exists' >&2
+    exit 1
+  fi
+  rm -f "$request"
+fi
+
+nonce=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+tmp=$(mktemp "$state_dir/.remote-request.XXXXXX")
+trap 'rm -f "$tmp"' EXIT
+jq -n \
+  --arg target "$target_id" \
+  --arg path "$target_path" \
+  --arg nonce "$nonce" \
+  --argjson created "$now" \
+  '{version: 1, target: $target, path: $path, nonce: $nonce, created_at: $created}' > "$tmp"
+chmod 600 "$tmp"
+mv -f "$tmp" "$request"
+trap - EXIT
+flock -u 9
+
+remote_target="$client_user@$client_host"
+remote_command="open -n -a Moonlight --args stream \"$sunshine_host\" \"$sunshine_app\" --display-mode \"$display_mode\" --resolution \"$resolution\""
+if ! ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+  "$remote_target" "$remote_command"; then
+  rm -f "$request"
+  printf '%s\n' 'zoxy-stream-request: could not launch Moonlight on the client' >&2
+  exit 1
+fi
+printf '%s\n' 'zoxy-stream-request: Moonlight launch requested'

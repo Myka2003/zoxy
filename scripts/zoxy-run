@@ -1,0 +1,28 @@
+if [ "$#" -lt 1 ] || [ ! -f "$1" ]; then
+  printf '%s\n' 'usage: zoxy-run /path/to/game.exe [args...]' >&2
+  exit 2
+fi
+
+target="$1"
+shift
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+export PROTONPATH="${PROTONPATH:-$HOME/.local/share/Steam/steamapps/common/Proton 11.0}"
+if [ ! -d "$PROTONPATH" ] && [ -d "$HOME/.local/share/Steam/steamapps/common/Proton - Experimental" ]; then
+  export PROTONPATH="$HOME/.local/share/Steam/steamapps/common/Proton - Experimental"
+fi
+
+proxy_file="${XDG_CONFIG_HOME:-$HOME/.config}/zoxy/proxy"
+if [ -r "$proxy_file" ]; then
+  proxy=$(cat "$proxy_file")
+  export HTTP_PROXY="${HTTP_PROXY:-$proxy}"
+  export HTTPS_PROXY="${HTTPS_PROXY:-$proxy}"
+  export http_proxy="${http_proxy:-$proxy}"
+  export https_proxy="${https_proxy:-$proxy}"
+fi
+
+dir_name=$(basename "$(dirname "$target")")
+clean_id=$(printf '%s' "$dir_name" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')
+export GAMEID="umu-${clean_id:-game}"
+cd "$(dirname "$target")"
+exec umu-run "$target" "$@"

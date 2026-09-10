@@ -1,0 +1,6 @@
+for _ in $(seq 1 60); do
+  [ -S "$XDG_RUNTIME_DIR/wayland-game" ] && exit 0
+  sleep 1
+done
+printf '%s\n' 'zoxy-stream-wait-wayland: isolated Wayland session is unavailable' >&2
+exit 1

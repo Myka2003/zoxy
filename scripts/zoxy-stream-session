@@ -1,0 +1,168 @@
+exec >>/tmp/zoxy-stream-session.log 2>&1
+echo "=== $(date) zoxy-stream-session started ==="
+
+if [ "$#" -ne 0 ]; then
+  printf '%s\n' 'zoxy-stream-session: arguments are not allowed' >&2
+  exit 2
+fi
+
+state_dir="$HOME/.local/state/zoxy"
+request="$state_dir/remote-request.json"
+active="$state_dir/remote-active.json"
+lock_file="$state_dir/remote.lock"
+config="${ZOXY_CONFIG:-/etc/zoxy/config.json}"
+install -d -m 700 "$state_dir"
+exec 9>"$lock_file"
+chmod 0600 "$lock_file"
+flock -w 5 9 || {
+  printf '%s\n' 'zoxy-stream-session: request lock is busy' >&2
+  exit 1
+}
+if [ ! -r "$request" ]; then
+  printf '%s\n' 'zoxy-stream-session: no pending game request' >&2
+  exit 1
+fi
+if [ -e "$active" ]; then
+  printf '%s\n' 'zoxy-stream-session: another game is already active' >&2
+  exit 1
+fi
+
+now=$(date +%s)
+if ! jq -e --argjson now "$now" '
+  (.version == 1)
+  and ((.path | type) == "string")
+  and ((.path | ascii_downcase) | endswith(".exe"))
+  and ((.nonce | type) == "string")
+  and ((.nonce | length) >= 16)
+  and ((.created_at | type) == "number")
+  and (.created_at >= ($now - 120))
+  and (.created_at <= ($now + 30))
+' "$request" >/dev/null; then
+  rm -f "$request"
+  printf '%s\n' 'zoxy-stream-session: invalid or expired game request' >&2
+  exit 1
+fi
+
+mv -f "$request" "$active"
+sunshine_log="$HOME/.config/sunshine/sunshine.log"
+sunshine_log_next_line=1
+if [ -r "$sunshine_log" ]; then
+  sunshine_log_next_line=$(( $(wc -l < "$sunshine_log") + 1 ))
+fi
+game_pid=""
+watcher_pid=""
+host_default_sink=$(pactl get-default-sink 2>/dev/null || true)
+case "$host_default_sink" in
+  "${ZOXY_AUDIO_SINK:-sink-zoxy-stream}"|sink-sunshine-*)
+    host_default_sink=$(pactl list short sinks | while read -r _ sink_name _; do
+      case "$sink_name" in
+        auto_null|"${ZOXY_AUDIO_SINK:-sink-zoxy-stream}"|sink-sunshine-*) ;;
+        *) printf '%s\n' "$sink_name"; break ;;
+      esac
+    done)
+    ;;
+esac
+
+
+watch_disconnect() {
+  local pid=$1
+  local next_line=$sunshine_log_next_line
+  local line_count
+  local lines
+  local connected=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ -r "$sunshine_log" ]; then
+      line_count=$(wc -l < "$sunshine_log")
+      if [ "$line_count" -ge "$next_line" ]; then
+        lines=$(sed -n "${next_line},${line_count}p" "$sunshine_log")
+        next_line=$((line_count + 1))
+        while IFS= read -r line; do
+          [ -n "$line" ] || continue
+          if [ "$connected" -eq 0 ] && printf '%s\n' "$line" | grep -Fq 'CLIENT CONNECTED'; then
+            connected=1
+          elif [ "$connected" -eq 1 ] && printf '%s\n' "$line" | grep -Fq 'CLIENT DISCONNECTED'; then
+            kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+            return
+          fi
+        done <<< "$lines"
+      fi
+    fi
+    sleep 1
+  done
+}
+
+# shellcheck disable=SC2329
+cleanup() {
+  status=$?
+  trap - EXIT INT TERM
+  if [ -n "$watcher_pid" ]; then
+    kill "$watcher_pid" 2>/dev/null || true
+  fi
+  if [ -n "$game_pid" ]; then
+    kill -TERM -- "-$game_pid" 2>/dev/null || kill -TERM "$game_pid" 2>/dev/null || true
+    sleep 1
+    kill -KILL -- "-$game_pid" 2>/dev/null || kill -KILL "$game_pid" 2>/dev/null || true
+  fi
+  if [ -n "$host_default_sink" ]; then
+    pactl set-default-sink "$host_default_sink" 2>/dev/null || true
+  fi
+  rm -f "$active"
+  exit "$status"
+}
+trap cleanup EXIT INT TERM
+
+target=$(jq -er '.path' "$active")
+if [ ! -f "$target" ]; then
+  printf 'zoxy-stream-session: game file does not exist: %s\n' "$target" >&2
+  exit 1
+fi
+
+allowed=0
+if [ -r "$config" ]; then
+  while IFS= read -r root_dir; do
+    [ -n "$root_dir" ] || continue
+    real_root=$(realpath -e "$root_dir" 2>/dev/null || true)
+    if [ -n "$real_root" ]; then
+      case "$target" in "$real_root"/*) allowed=1; break ;; esac
+    fi
+  done < <(jq -r '.gameRoots[]? // empty' "$config")
+fi
+
+if [ "$allowed" -ne 1 ]; then
+  printf 'zoxy-stream-session: game path outside configured roots: %s\n' "$target" >&2
+  exit 1
+fi
+
+runner="zoxy-run"
+if ! command -v "$runner" >/dev/null 2>&1; then
+  for candidate in "/run/current-system/sw/bin/zoxy-run" "$HOME/.nix-profile/bin/zoxy-run"; do
+    if [ -x "$candidate" ]; then runner="$candidate"; break; fi
+  done
+fi
+
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-game}"
+unset DISPLAY
+set +e
+setsid gamescope \
+  --backend wayland \
+  --output-width 1920 \
+  --output-height 1080 \
+  --nested-width 1920 \
+  --nested-height 1080 \
+  --nested-refresh 60 \
+  --fullscreen \
+  --force-grab-cursor \
+  -- "$runner" "$target" &
+game_pid=$!
+watch_disconnect "$game_pid" &
+watcher_pid=$!
+wait "$game_pid"
+status=$?
+set -e
+if [ -n "$watcher_pid" ]; then
+  kill "$watcher_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+  watcher_pid=""
+fi
+game_pid=""
+exit "$status"

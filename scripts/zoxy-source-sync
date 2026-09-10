@@ -1,0 +1,57 @@
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/zoxy"
+sources_file="$config_dir/sources.txt"
+proxy_file="$config_dir/proxy"
+cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/zoxy"
+cache_dir="$cache_root/sources"
+proxy="${ZOXY_SOURCE_PROXY:-${GAME_SOURCE_PROXY:-}}"
+
+if [ -z "$proxy" ] && [ -r "$proxy_file" ]; then
+  IFS= read -r proxy < "$proxy_file"
+fi
+case "$proxy" in
+  ""|http://*|https://*|socks5://*|socks5h://*) ;;
+  *)
+    printf 'zoxy-source-sync: invalid proxy URL in %s\n' "$proxy_file" >&2
+    exit 2
+    ;;
+esac
+
+if [ ! -r "$sources_file" ]; then
+  printf 'zoxy-source-sync: create %s with one HTTPS source URL per line\n' "$sources_file" >&2
+  exit 1
+fi
+
+mkdir -p "$cache_root"
+next_dir=$(mktemp -d "$cache_root/.sources.XXXXXX")
+trap 'rm -rf "$next_dir"' EXIT
+count=0
+
+while IFS= read -r url || [ -n "$url" ]; do
+  case "$url" in
+    ""|\#*) continue ;;
+    https://*) ;;
+    *)
+      printf 'zoxy-source-sync: expected an HTTPS URL, got: %s\n' "$url" >&2
+      exit 2
+      ;;
+  esac
+
+  target="$next_dir/$(printf '%s' "$url" | sha256sum | cut -d ' ' -f 1).json"
+  curl_args=(--fail --location --proto '=https' --connect-timeout 15 --max-time 180 --retry 2)
+  if [ -n "$proxy" ]; then
+    curl_args+=(--proxy "$proxy")
+  fi
+  curl "${curl_args[@]}" --output "$target" "$url"
+  jq -e 'type == "object" and (.downloads | type == "array")' "$target" >/dev/null
+  count=$((count + 1))
+done < "$sources_file"
+
+if [ "$count" -eq 0 ]; then
+  printf '%s\n' 'zoxy-source-sync: source list is empty' >&2
+  exit 1
+fi
+
+rm -rf "$cache_dir"
+mv "$next_dir" "$cache_dir"
+trap - EXIT
+printf 'zoxy-source-sync: updated %s source(s)\n' "$count"
